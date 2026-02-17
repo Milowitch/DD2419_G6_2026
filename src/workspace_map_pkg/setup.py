@@ -23,7 +23,7 @@ setup(
                     'workspace_map = workspace_map_pkg.workspace_map_node:main',
                     'Testslam = workspace_map_pkg.testslam:main ',
                     'AS = workspace_map_pkg.AS:main ',
-                    'hsvtune = workspace_map_pkg.hsvtune:main'
+
         ],
     },
 )
