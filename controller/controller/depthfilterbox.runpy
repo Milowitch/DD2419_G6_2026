@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist, PointStamped
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Header
+import sensor_msgs_py.point_cloud2 as pc2
+import numpy as np
+import open3d as o3d
+import struct
+import math
+
+import tf2_ros
+from tf2_geometry_msgs import do_transform_point
+
+class BoxFollowerNode(Node):
+    def __init__(self):
+        super().__init__('box_follower_node')
+
+        # Subscribers & Publishers
+        self.pc_sub = self.create_subscription(PointCloud2, '/realsense/depth/color/points', self.pc_callback, 10)
+        self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+
+        self.cluster_pub = self.create_publisher(PointCloud2, '/camera/depth/clusters', 10)
+        self.target_pub = self.create_publisher(PointStamped, '/camera/depth/target_20cm_before', 10)
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        # TF
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # Parameters
+        self.min_distance = 0.0
+        self.max_distance = 0.6
+        self.height_min = -0.05
+        self.height_max = 0.5
+        self.voxel_size = 0.01
+        self.distance_threshold = 0.02
+        self.eps = 0.08
+        self.min_points = 20
+
+        # Controller
+        self.kp_linear = 0.3
+        self.kp_angular = 2.0
+        self.max_linear_speed = 0.2
+        self.max_angular_speed = 1.0
+
+        # State
+        self.robot_pose = None
+        self.target_point_odom = None
+        self.target_published = False
+        self.box_centroid_camera = None
+
+        # Timer for control
+        self.control_timer = self.create_timer(0.05, self.control_loop)
+
+        self.get_logger().info("BoxFollowerNode started (single target publish)")
+
+    # Odometry
+    def odom_callback(self, msg):
+        self.robot_pose = (msg.pose.pose.position.x,
+                           msg.pose.pose.position.y,
+                           self.get_yaw_from_quaternion(msg.pose.pose.orientation))
+
+    # Point cloud
+    def pc_callback(self, msg: PointCloud2):
+        if self.target_published:
+            return  # Skip after publishing target once
+
+        points = pc2.read_points_numpy(msg, field_names=("x","y","z"), skip_nans=True)
+        if points.shape[0] < 50:
+            return
+
+        xyz = points[:, :3]
+        dist = np.linalg.norm(xyz, axis=1)
+        mask = (dist > self.min_distance) & (dist < self.max_distance)
+        xyz = xyz[mask]
+        if xyz.shape[0] < 20:
+            return
+
+        cloud = o3d.geometry.PointCloud()
+        cloud.points = o3d.utility.Vector3dVector(xyz)
+        cloud = cloud.voxel_down_sample(self.voxel_size)
+
+        plane_model, inliers = cloud.segment_plane(distance_threshold=self.distance_threshold,
+                                                   ransac_n=4, num_iterations=1000)
+        normal = np.array(plane_model[:3])
+        normal /= np.linalg.norm(normal)
+        if abs(normal[1]) > 0.9:
+            non_ground_cloud = cloud.select_by_index(inliers, invert=True)
+        else:
+            non_ground_cloud = cloud
+
+        filtered_xyz = np.asarray(non_ground_cloud.points)
+        height_mask = (filtered_xyz[:,1]>self.height_min) & (filtered_xyz[:,1]<self.height_max)
+        filtered_xyz = filtered_xyz[height_mask]
+        if filtered_xyz.shape[0] < 5:
+            return
+
+        cluster_cloud = o3d.geometry.PointCloud()
+        cluster_cloud.points = o3d.utility.Vector3dVector(filtered_xyz)
+        labels = np.array(cluster_cloud.cluster_dbscan(eps=self.eps, min_points=self.min_points, print_progress=False))
+        if labels.max() < 0:
+            return
+
+        largest_cluster = np.argmax([np.sum(labels==i) for i in range(labels.max()+1)])
+        cluster_pts = filtered_xyz[labels==largest_cluster]
+        centroid = np.mean(cluster_pts, axis=0)
+        self.box_centroid_camera = centroid
+
+        # Transform centroid to odom
+        try:
+            p = PointStamped()
+            p.header.stamp = self.get_clock().now().to_msg()
+            p.header.frame_id = 'realsense_camera_depth_optical_frame'
+            p.point.x, p.point.y, p.point.z = centroid
+            transform = self.tf_buffer.lookup_transform('odom', p.header.frame_id, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.5))
+            centroid_odom = do_transform_point(p, transform)
+
+            # Compute 20cm-before point along robot→box line
+            if self.robot_pose:
+                x_r, y_r, _ = self.robot_pose
+                dx = centroid_odom.point.x - x_r
+                dy = centroid_odom.point.y - y_r
+                dist = math.hypot(dx, dy)
+                if dist < 0.01:
+                    return
+                ux, uy = dx/dist, dy/dist
+                target_x = centroid_odom.point.x - 0.35*ux
+                target_y = centroid_odom.point.y - 0.35*uy
+                target_z = centroid_odom.point.z
+
+                self.target_point_odom = PointStamped()
+                self.target_point_odom.header.stamp = self.get_clock().now().to_msg()
+                self.target_point_odom.header.frame_id = 'odom'
+                self.target_point_odom.point.x = target_x
+                self.target_point_odom.point.y = target_y
+                self.target_point_odom.point.z = target_z
+
+                self.target_pub.publish(self.target_point_odom)
+                self.target_published = True
+                self.get_logger().info(f"[TARGET PUBLISHED] x={target_x:.2f}, y={target_y:.2f}, z={target_z:.2f}")
+
+        except Exception as e:
+            self.get_logger().warn(f"TF failed: {e}")
+
+        # Publish colored cluster cloud
+        colors = np.zeros((filtered_xyz.shape[0],3))
+        colors[labels==largest_cluster] = [0,1,0]
+        colors[labels!=largest_cluster] = [1,0,0]
+        cluster_msg = self.numpy_to_pointcloud2_rgb(filtered_xyz, colors, msg.header.stamp, msg.header.frame_id)
+        self.cluster_pub.publish(cluster_msg)
+
+    # Control loop in odom frame
+    # -----------------------------
+    def control_loop(self):
+        if self.target_point_odom is None or self.robot_pose is None:
+            return
+
+        # Robot pose
+        x, y, yaw = self.robot_pose
+
+        # Target point
+        tx = self.target_point_odom.point.x
+        ty = self.target_point_odom.point.y
+
+        # ----------------------------
+        # Errors
+        # ----------------------------
+        dx = tx - x
+        dy = ty - y
+        d = math.hypot(dx, dy)
+        target_theta = math.atan2(dy, dx)
+        delta_theta = self.normalize_angle(target_theta - yaw)
+
+        # ----------------------------
+        # Controller parameters
+        # ----------------------------
+        self.v_max = 0.2    # max linear speed
+        self.v_min = 0.05   # min linear speed
+        self.w_max = 1.0    # max angular speed
+        self.k1 = 0.7       # linear gain
+        self.k2 = 9.0      # angular gain
+        self.k3 = 5.0       # nonlinear decay
+        self.rotate_threshold = 0.3  # rad, rotate in place if angular error > threshold
+
+        # =============================
+        # Rotate-first + Nonlinear Controller
+        # =============================
+        if abs(delta_theta) > self.rotate_threshold:
+            v = 0.0
+            w = math.copysign(self.w_max, delta_theta)
+        else:
+            v = max(self.v_min, min(self.v_max, self.k1*d) * math.exp(-self.k3*delta_theta**2))
+            w = math.copysign(min(self.w_max, self.k2*abs(delta_theta)), delta_theta)
+
+        # Publish command
+        cmd = Twist()
+        cmd.linear.x = v
+        cmd.angular.z = w
+        self.cmd_pub.publish(cmd)
+
+        if d < 0.05:
+            self.get_logger().info("Reached 20cm-before target point")
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            self.cmd_pub.publish(cmd)
+
+
+    @staticmethod
+    def normalize_angle(angle):
+            while angle > math.pi:
+                angle -= 2*math.pi
+            while angle < -math.pi:
+                angle += 2*math.pi
+            return angle
+
+    @staticmethod
+    def get_yaw_from_quaternion(q):
+            siny_cosp = 2.0*(q.w*q.z + q.x*q.y)
+            cosy_cosp = 1.0 - 2.0*(q.y*q.y + q.z*q.z)
+            return math.atan2(siny_cosp, cosy_cosp)
+
+    def numpy_to_pointcloud2_rgb(self, points, colors, stamp, frame_id):
+        header = Header()
+        header.stamp = stamp
+        header.frame_id = frame_id
+        fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="rgb", offset=12, datatype=PointField.UINT32, count=1),
+        ]
+        cloud_data = []
+        for i in range(points.shape[0]):
+            x,y,z = points[i]
+            r,g,b = (colors[i]*255).astype(int)
+            rgb = struct.unpack('I', struct.pack('BBBB', b,g,r,255))[0]
+            cloud_data.append([x,y,z,rgb])
+        return pc2.create_cloud(header, fields, cloud_data)
+
+def main():
+    rclpy.init()
+    node = BoxFollowerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
